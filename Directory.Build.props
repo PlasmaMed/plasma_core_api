@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup>
+    <!-- macOS stores extended metadata in AppleDouble files on external drives. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);**/._*</DefaultItemExcludes>
+  </PropertyGroup>
+</Project>

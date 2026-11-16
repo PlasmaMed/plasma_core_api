@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
+    <UserSecretsId>core-plasma-api</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.12" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.12">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="Serilog.AspNetCore" Version="10.0.0" />
+    <PackageReference Include="Swashbuckle.AspNetCore" Version="10.2.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CorePlasma.BAL\CorePlasma.BAL.csproj" />
+    <ProjectReference Include="..\CorePlasma.Common\CorePlasma.Common.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="SourceSync/validation/**" />
+    <Content Remove="SourceSync/validation/**" />
+    <Compile Remove="SourceBusiness/validation/**" />
+    <Content Remove="SourceBusiness/validation/**" />
+    <Content Update="appsettings.Development.json;appsettings.SqlServerTest.json" CopyToPublishDirectory="Never" />
+    <Content Update="appsettings.Production.json" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
+    <Content Update="appsettings.Production.example.json" CopyToOutputDirectory="Never" CopyToPublishDirectory="Always" TargetPath="appsettings.Production.json" />
+  </ItemGroup>
+
+</Project>

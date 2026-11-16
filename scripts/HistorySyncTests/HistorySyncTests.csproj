@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <ProjectReference Include="../../src/CorePlasma.API/CorePlasma.API.csproj" />
+    <Compile Include="../../../../newapp.plasmamed.vn/plm-api/PlasmaVN.API/Integration/ApiKeyAuthenticationHandler.cs" Link="PLM/ApiKeyAuthenticationHandler.cs" />
+    <Compile Include="../../../../newapp.plasmamed.vn/plm-api/PlasmaVN.API/Integration/IntegrationPeerClient.cs" Link="PLM/IntegrationPeerClient.cs" />
+    <Compile Include="../../../../newapp.plasmamed.vn/plm-api/PlasmaVN.API/Integration/IntegrationReadRequest.cs" Link="PLM/IntegrationReadRequest.cs" />
+    <Compile Include="../../../../newapp.plasmamed.vn/plm-api/PlasmaVN.API/History/CoreHistoryContracts.cs" Link="PLM/CoreHistoryContracts.cs" />
+    <Compile Include="../../../../newapp.plasmamed.vn/plm-api/PlasmaVN.API/History/CoreHistoryPublisher.cs" Link="PLM/CoreHistoryPublisher.cs" />
+    <Compile Include="../../../../newapp.plasmamed.vn/plm-api/PlasmaVN.API/History/CoreHistoryWorker.cs" Link="PLM/CoreHistoryWorker.cs" />
+    <Compile Include="../../../../newapp.plasmamed.vn/plm-api/PlasmaVN.API/History/CoreHistoryOutboxEnqueuer.cs" Link="PLM/CoreHistoryOutboxEnqueuer.cs" />
+    <Compile Include="../../../../newapp.plasmamed.vn/plm-api/PlasmaVN.API/History/EfCoreHistoryOutboxStore.cs" Link="PLM/EfCoreHistoryOutboxStore.cs" />
+    <Compile Include="../../../../newapp.plasmamed.vn/plm-api/PlasmaMED.Service/History/SessionHistoryEvent.cs" Link="PLM/SessionHistoryEvent.cs" />
+    <Compile Include="../../../../newapp.plasmamed.vn/plm-api/PlasmaVN.Infrastructure/Entities/CoreHistoryOutbox.cs" Link="PLM/CoreHistoryOutbox.cs" />
+    <Compile Include="../../../../newapp.plasmamed.vn/plm-api/PlasmaVN.Infrastructure/Migrations/20261012130000_AddCoreHistoryOutbox.cs" Link="PLM/AddCoreHistoryOutbox.cs" />
+    <Compile Include="../../../../newapp.plasmamed.vn/plm-api/scripts/HistoryBackfill/Program.cs" Link="PLM/HistoryBackfillProgram.cs" />
+  </ItemGroup>
+</Project>

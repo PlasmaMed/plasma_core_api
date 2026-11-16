@@ -1,0 +1,127 @@
+using System.Text.Json;
+using CorePlasma.API.SourceSync;
+using CorePlasma.Common.Exceptions;
+using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Options;
+
+internal static class SqlCases
+{
+    public static async Task RunAsync()
+    {
+        var connection = Environment.GetEnvironmentVariable("SOURCE_SYNC_TEST_SQL");
+        if (string.IsNullOrEmpty(connection)) { Console.WriteLine("SQL integration not run: SOURCE_SYNC_TEST_SQL is absent."); return; }
+        var parsed = new SqlConnectionStringBuilder(connection);
+        if (!(parsed.DataSource.StartsWith("127.0.0.1,", StringComparison.Ordinal) || parsed.DataSource.StartsWith("localhost,", StringComparison.Ordinal))
+            || parsed.InitialCatalog != "core_source_sync_validation_20261109")
+            throw new Exception("SQL fixture requires explicit loopback and an owned disposable validation database.");
+        await using var db = new SqlConnection(connection);
+        await db.OpenAsync();
+        async Task<object?> Scalar(string sql)
+        {
+            await using var command = new SqlCommand(sql, db);
+            return await command.ExecuteScalarAsync();
+        }
+        if ((string?)await Scalar("SELECT CONVERT(nvarchar(128),value) FROM sys.extended_properties WHERE class=0 AND name=N'core_source_sync_validation_owner'") != "core-source-sync-validation-v1")
+            throw new Exception("SQL fixture ownership marker is missing.");
+        if (await Scalar("SELECT OBJECT_ID(N'source_sync.sources')") is not DBNull)
+            throw new Exception("SQL fixture requires a fresh empty owned database; no destructive reset is performed.");
+        await using (var install = new SqlCommand(await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "install.sql")), db))
+            await install.ExecuteNonQueryAsync();
+        await using (var sentinel = new SqlCommand("CREATE TABLE dbo.do_not_touch(id int NOT NULL PRIMARY KEY); INSERT INTO dbo.do_not_touch VALUES(42)", db))
+            await sentinel.ExecuteNonQueryAsync();
+        var installation = Guid.NewGuid();
+        var generation = Guid.NewGuid();
+        var options = new SourceSyncOptions { Enabled = true, ConnectionString = connection,
+            Sources = new() { ["newapp"] = new() { InstallationId = installation, Key = new string('x', 40) } } };
+        var store = new SourceSyncStore(new FixedOptions(options));
+        var ct = CancellationToken.None;
+        var table = new SourceSyncTable("Synthetic", ["id", "value", "nullable"], ["id"], "catalog-v1");
+        var heap = new SourceSyncTable("Heap", ["value", "nullable"], [], "catalog-v1");
+        JsonElement Row(string json) => JsonDocument.Parse(json).RootElement.Clone();
+        var old = Row("{\"id\":\"1\",\"value\":\"xin chào 🧪\",\"nullable\":null}");
+        var changed = Row("{\"id\":\"2\",\"value\":\"0.00000000000000000000100\",\"nullable\":\"\"}");
+        var duplicate = Row("{\"value\":\"duplicate\",\"nullable\":null}");
+        var begin = new SourceSyncBegin(installation, generation, "1:2:", [table, heap]);
+        await store.BeginAsync("newapp", begin, ct);
+        await store.BeginAsync("newapp", begin, ct);
+        var chunk = new SourceSyncRows(installation, generation, table.Name, Guid.NewGuid(), [old]);
+        await store.RowsAsync("newapp", chunk, ct);
+        await store.RowsAsync("newapp", chunk, ct);
+        await store.RowsAsync("newapp", new(installation, generation, heap.Name, Guid.NewGuid(), [duplicate, duplicate]), ct);
+        var complete = new SourceSyncComplete(installation, generation, [new(table.Name, "1"), new(heap.Name, "2")]);
+        await store.CompleteAsync("newapp", complete, ct);
+        while (await store.FinalizeNextAsync("newapp", ct)) { }
+        var heapPage = await store.ReadPageAsync("newapp", heap.Name, null, 1, null, null, null, ct);
+        if (heapPage.Rows.Count != 1 || heapPage.Rows[0].Occurrences != 2 || heapPage.NextCursor is not null
+            || heapPage.Rows[0].Values["value"] != "duplicate" || heapPage.Rows[0].Values["nullable"] is not null)
+            throw new Exception("Keyless paging lost duplicate-row multiplicity or exact values.");
+        var pkPage = await store.ReadPageAsync("newapp", table.Name, null, 1, null, null, null, ct);
+        if (pkPage.Rows.Count != 1 || pkPage.Rows[0].Occurrences != 1) throw new Exception("PK paging occurrence compatibility failed.");
+        async Task Reject(Func<Task> action)
+        {
+            try { await action(); } catch (ConflictException) { return; }
+            throw new Exception("SQL integration expected a conflict.");
+        }
+        await Reject(() => store.RowsAsync("newapp", chunk with { Rows = [changed] }, ct));
+        SourceSyncEvent Event(string id, string tableName, string operation, JsonElement before, JsonElement after) =>
+            new(id, "5", tableName, operation, before, after, "2026-11-09T00:00:00.123456Z");
+        var nil = Row("null");
+        var batch = new SourceSyncEvents(installation, generation, Guid.NewGuid(), [
+            Event("1", table.Name, "UPDATE", old, changed), Event("2", heap.Name, "DELETE", duplicate, nil)]);
+        await store.EventsAsync("newapp", batch, ct);
+        await store.EventsAsync("newapp", batch, ct);
+        await store.CompleteAsync("newapp", complete, ct); // completion retry remains valid after CDC changed counts
+        if ((long)(await Scalar("SELECT COUNT_BIG(*) FROM source_newapp.Heap"))! != 1)
+            throw new Exception("Keyless duplicate delete changed the wrong multiplicity.");
+        var loaded = await store.ReadRowAsync("newapp", table.Name, new Dictionary<string,string?> { ["id"] = "2" }, ct);
+        if (loaded?.Values["nullable"] != "" || loaded.Values["value"] != "0.00000000000000000000100")
+            throw new Exception("Raw lexical value or NULL/empty fidelity failed.");
+        var extra = Row("{\"id\":\"3\",\"value\":\"rollback\",\"nullable\":null}");
+        await Reject(() => store.EventsAsync("newapp", new(installation, generation, Guid.NewGuid(), [
+            Event("3", table.Name, "INSERT", nil, extra), Event("4", table.Name, "DELETE", old, nil)]), ct));
+        if ((long)(await Scalar("SELECT COUNT_BIG(*) FROM source_sync.events"))! != 2
+            || (long)(await Scalar("SELECT COUNT_BIG(*) FROM source_newapp.Synthetic"))! != 1)
+            throw new Exception("Failed batch did not roll back all rows and receipts.");
+        await Reject(() => store.EventsAsync("newapp", new(installation, generation, Guid.NewGuid(), [Event("1", table.Name, "DELETE", changed, nil)]), ct));
+        await store.EventsAsync("newapp", new(installation, generation, Guid.NewGuid(), [Event("5", heap.Name, "TRUNCATE", nil, nil)]), ct);
+        if ((long)(await Scalar("SELECT COUNT_BIG(*) FROM source_newapp.Heap"))! != 0
+            || (int)(await Scalar("SELECT id FROM dbo.do_not_touch"))! != 42)
+            throw new Exception("Truncate or native sentinel preservation failed.");
+        var state = await store.GetStateAsync("newapp", ct);
+        if (state?.Status != "ready" || state.PendingProjectionCount != 3) throw new Exception("Durable native pending state is incorrect.");
+        var largeBatch = Guid.NewGuid();
+        var large = Enumerable.Range(10, 1001).Select(id => Event(id.ToString(System.Globalization.CultureInfo.InvariantCulture), table.Name, "INSERT", nil,
+            JsonSerializer.SerializeToElement(new Dictionary<string,string?> { ["id"] = id.ToString(), ["value"] = "large-prefix", ["nullable"] = null })) with { TransactionId = "100" }).ToArray();
+        var firstPart = new SourceSyncEventPart(installation, generation, largeBatch, 0, large[..1000]);
+        await store.StagePartAsync("newapp", firstPart, ct);
+        await store.StagePartAsync("newapp", firstPart, ct);
+        await Reject(() => store.CommitEventsAsync("newapp", new(installation, generation, largeBatch, 2, "1001"), ct));
+        await store.StagePartAsync("newapp", new(installation, generation, largeBatch, 1, large[1000..]), ct);
+        await store.CommitEventsAsync("newapp", new(installation, generation, largeBatch, 2, "1001"), ct);
+        if ((long)(await Scalar("SELECT COUNT_BIG(*) FROM source_newapp.Synthetic"))! != 1) throw new Exception("Staging falsely applied partial rows.");
+        if (!await store.ProcessStagedBatchAsync("newapp", ct)) throw new Exception("Staged source batch did not apply.");
+        if ((long)(await Scalar("SELECT COUNT_BIG(*) FROM source_newapp.Synthetic"))! != 1002
+            || (long)(await Scalar("SELECT COUNT_BIG(*) FROM source_sync.events"))! != 1004)
+            throw new Exception("Multipart source rows/receipts did not commit as a whole.");
+        await store.CommitEventsAsync("newapp", new(installation, generation, largeBatch, 2, "1001"), ct);
+        await store.StagePartAsync("newapp", firstPart, ct);
+        var failed = Guid.NewGuid();
+        await store.StagePartAsync("newapp", new(installation, generation, failed, 0, [Event("2000", table.Name, "INSERT", nil, extra)]), ct);
+        await store.StagePartAsync("newapp", new(installation, generation, failed, 1, [Event("2001", table.Name, "DELETE", old, nil)]), ct);
+        await store.CommitEventsAsync("newapp", new(installation, generation, failed, 2, "2"), ct);
+        if (await store.ProcessStagedBatchAsync("newapp", ct)) throw new Exception("Invalid multipart before-image was accepted.");
+        if ((long)(await Scalar("SELECT COUNT_BIG(*) FROM source_newapp.Synthetic"))! != 1002
+            || (long)(await Scalar("SELECT COUNT_BIG(*) FROM source_sync.events"))! != 1004)
+            throw new Exception("Failed multipart source batch left partial rows/receipts.");
+        if ((string?)await Scalar("SELECT state FROM source_sync.event_jobs WHERE event_count=2") != "failed")
+            throw new Exception("Failed multipart error was not durable.");
+        Console.WriteLine("SQL integration passed: idempotent snapshot/CDC, PK update, keyless duplicates, rollback, conflicts, truncate, fidelity and native sentinel.");
+    }
+
+    private sealed class FixedOptions(SourceSyncOptions value) : IOptionsMonitor<SourceSyncOptions>
+    {
+        public SourceSyncOptions CurrentValue => value;
+        public SourceSyncOptions Get(string? name) => value;
+        public IDisposable? OnChange(Action<SourceSyncOptions, string?> listener) => null;
+    }
+}

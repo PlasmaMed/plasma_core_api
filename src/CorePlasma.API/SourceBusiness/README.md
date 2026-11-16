@@ -1,0 +1,11 @@
+# Source business views
+
+`GET /api/source-business/catalog?source=quanly|newapp` and `GET /api/source-business/{source}/{table}` require an employee JWT and `SOURCE_BUSINESS_VIEW`. `MENU_SOURCE_BUSINESS` controls navigation only. The existing Super Admin bypass remains valid; no employee grants or source authentication roles are imported.
+
+`SourceBusinessCatalog` explicitly enumerates business tables. Its `Native` entries are idempotently projected to `dbo.CoreBusinessRecords`; the remaining entries are paginated operational views over the private raw reader. Existing canonical customer, employee, tank, engine, order and transfer models remain owned by `SourceProjection`. Large histories/sessions are never duplicated as generic EF records. Infrastructure, permission and device-token tables are excluded. User rows expose only an explicit descriptive profile allowlist. Secrets and ACL fields are removed recursively from structured values before storage and again before response serialization.
+
+The projector uses the exact registered primary key hash and installation binding. It never infers identity from names or serial numbers. Events coalesce against the latest verified raw row, including old and new keys for primary key changes; baseline reconciliation tombstones missing records only after a full successful table scan. A durable generation/catalog/policy checkpoint avoids repeated baseline scans. Source-owned workflows are displayed read-only.
+
+Deploy `install.sql` offline before enabling the projection worker. It permits only `core_plasma` or the explicitly marked `core_source_sync_validation_20261109` fixture; it creates the two business tables and permission definitions, with no grants. The separate private SourceSync SQL connection reads raw schemas; the normal EF connection only reads/writes native business records.
+
+`validation/SourceBusinessPolicyTests.csproj` is a standalone deterministic policy test: catalog exclusions, profile field allowlist, recursive structured redaction, safe search columns, and source deletion markers. Build/run it only on an environment where execution is permitted. Local Windows Application Control may prevent newly compiled assemblies from running; do not work around that policy.

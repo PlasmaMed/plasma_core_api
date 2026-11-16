@@ -1,0 +1,30 @@
+using System.Text.Json;
+using CorePlasma.API.SourceBusiness;
+using CorePlasma.API.SourceSync;
+
+var count = 0;
+void Check(bool condition, string name) { if (!condition) throw new Exception(name); count++; }
+foreach (var forbidden in new[] { "Password", "HashedPassword", "password_salt", "ApiKey", "access_token", "refreshToken", "Auth", "role_id", "CanApproveOrder", "PermissionIds", "ConnectionString", "SecurityStamp" })
+    Check(!SourceBusinessCatalog.SafeField("Ticket", forbidden), "credential field: " + forbidden);
+foreach (var table in new[] { "permissions", "permission_groups", "roles", "resource_privileges", "role_permissions", "user_device_tokens", "CoreHistoryOutbox", "CoreEntityOutbox", "CoreEntitySyncBootstrap", "__EFMigrationsHistory", "newtable_test" })
+    Check(SourceBusinessCatalog.Find("quanly", table) is null && SourceBusinessCatalog.Find("newapp", table) is null, "infrastructure excluded: " + table);
+Check(SourceBusinessCatalog.All.Select(x => (x.Source, x.Table)).Distinct().Count() == SourceBusinessCatalog.All.Count, "unique catalog");
+Check(SourceBusinessCatalog.Find("unknown", "Warehouse") is null, "unknown source");
+Check(SourceBusinessCatalog.Find("newapp", "Ticket")?.Native == true, "ticket materialized");
+Check(SourceBusinessCatalog.Find("quanly", "warehouses")?.Native == true, "warehouse materialized");
+Check(SourceBusinessCatalog.Find("newapp", "TankSession")?.Native == false, "large session not duplicated");
+var profile = SourceBusinessCatalog.Sanitize("User", new Dictionary<string, string?> { ["Id"] = "1", ["Name"] = "Nguyễn An", ["Email"] = "an@example.test", ["Username"] = "login-name", ["PasswordHash"] = "hidden", ["CanApproveOrder"] = "true", ["UnreviewedField"] = "hidden" });
+Check(profile.Count == 3 && profile["Name"] == "Nguyễn An", "profile descriptive allowlist");
+var nested = SourceBusinessCatalog.Sanitize("Ticket", new Dictionary<string, string?> { ["Details"] = "{\"note\":\"ok\",\"password\":\"hidden\",\"history\":[{\"token\":\"hidden\",\"status\":\"new\"}],\"embedded\":\"{\\\"api_key\\\":\\\"hidden\\\",\\\"name\\\":\\\"kept\\\"}\"}" });
+Check(!nested["Details"]!.Contains("hidden"), "nested credentials removed");
+Check(nested["Details"]!.Contains("kept") && nested["Details"]!.Contains("status"), "nested business fields retained");
+var malformed = SourceBusinessCatalog.Sanitize("Ticket", new Dictionary<string, string?> { ["Details"] = "{password:hidden" });
+Check(!malformed["Details"]!.Contains("hidden"), "malformed structured payload never forwarded");
+var attachments = SourceBusinessCatalog.Sanitize("import_tanks", new Dictionary<string, string?> { ["images"] = "{\"https://example.test/a.jpg\",\"https://example.test/b.jpg\"}" });
+Check(JsonSerializer.Deserialize<string[]>(attachments["images"]!)!.Length == 2, "PostgreSQL attachment arrays preserved");
+var manifest = new SourceSyncTable("User", ["Id", "Name", "PasswordHash", "Username", "IsActive"], ["Id"], "1");
+Check(SourceBusinessCatalog.SearchColumns("User", manifest).SequenceEqual(new[] { "Name" }), "search columns sanitized");
+Check(SourceBusinessCatalog.StatusColumn("User", manifest) == "IsActive", "safe status column");
+Check(SourceBusinessCatalog.Deleted(new Dictionary<string, string?> { ["IsDeleted"] = "true" }), "soft delete");
+Check(!SourceBusinessCatalog.Deleted(new Dictionary<string, string?> { ["IsDeleted"] = "false", ["deleted_at"] = null }), "not deleted");
+Console.WriteLine(JsonSerializer.Serialize(new { passed = count, materializedTables = SourceBusinessCatalog.All.Count(x => x.Native), operationalTables = SourceBusinessCatalog.All.Count(x => !x.Native) }));

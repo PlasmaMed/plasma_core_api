@@ -1,0 +1,119 @@
+using System.Data;
+using System.Security.Cryptography;
+using System.Text.Json;
+using CorePlasma.API.SourceSync;
+using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Options;
+
+internal static class CompareCases
+{
+    public static async Task RunAsync(string reportPath)
+    {
+        var connection = Environment.GetEnvironmentVariable("SOURCE_SYNC_TEST_SQL") ?? throw new Exception("Owned fixture SQL connection is required.");
+        var parsed = new SqlConnectionStringBuilder(connection);
+        if (parsed.InitialCatalog != "core_source_sync_validation_20261109"
+            || !(parsed.DataSource.StartsWith("127.0.0.1,", StringComparison.Ordinal) || parsed.DataSource.StartsWith("localhost,", StringComparison.Ordinal)))
+            throw new Exception("Read-only compare accepts only the exact owned loopback SQL fixture.");
+        var reportFile = new FileInfo(reportPath);
+        if (!reportFile.Exists || reportFile.Length > 16 * 1024 * 1024 || !reportFile.FullName.EndsWith("fixture-report.json", StringComparison.Ordinal))
+            throw new Exception("Invalid owned fixture digest report path.");
+        using var report = JsonDocument.Parse(await File.ReadAllTextAsync(reportFile.FullName));
+        var root = report.RootElement;
+        var source = root.GetProperty("source").GetString();
+        if (source != "quanly") throw new Exception("Read-only compare requires the literal quanly HTTP fixture.");
+        var installation = root.GetProperty("installationId").GetGuid();
+        var generation = root.GetProperty("generation").GetGuid();
+        var digests = root.GetProperty("sourceDigests").EnumerateArray().ToArray();
+        if (digests.Length is < 1 or > 256) throw new Exception("Invalid fixture digest relation count.");
+        await using var db = new SqlConnection(connection);
+        await db.OpenAsync();
+        await using (var owner = new SqlCommand("SELECT CONVERT(nvarchar(128),value) FROM sys.extended_properties WHERE class=0 AND name=N'core_source_sync_validation_owner'", db))
+            if (await owner.ExecuteScalarAsync() as string != "core-source-sync-validation-v1") throw new Exception("Fixture ownership marker mismatch.");
+        await using var tx = (SqlTransaction)await db.BeginTransactionAsync(IsolationLevel.Serializable);
+        await using (var sourceLock = new SqlCommand("DECLARE @r int; EXEC @r=sys.sp_getapplock @Resource=N'core-source-sync:quanly',@LockMode='Shared',@LockOwner='Transaction',@LockTimeout=10000; SELECT @r", db, tx))
+            if (Convert.ToInt32(await sourceLock.ExecuteScalarAsync()) < 0) throw new Exception("Fixture comparison cannot acquire a consistent source view.");
+        await using (var binding = new SqlCommand("SELECT installation_id,generation,state FROM source_sync.sources WHERE source_id=N'quanly'", db, tx))
+        await using (var reader = await binding.ExecuteReaderAsync())
+            if (!await reader.ReadAsync() || reader.GetGuid(0) != installation || reader.GetGuid(1) != generation || reader.GetString(2) != "ready")
+                throw new Exception("Fixture report binding or readiness differs from actual SQL source state.");
+        await using (var pending = new SqlCommand("SELECT COUNT_BIG(*) FROM source_sync.event_jobs WHERE source_id=N'quanly' AND state<>'applied'", db, tx))
+            if ((long)(await pending.ExecuteScalarAsync())! != 0) throw new Exception("Source HTTP fixture still has unapplied SQL batches.");
+        var tables = new Dictionary<string,SourceSyncTable>(StringComparer.Ordinal);
+        await using (var catalog = new SqlCommand("SELECT metadata FROM source_sync.tables WHERE source_id=N'quanly'", db, tx))
+        await using (var reader = await catalog.ExecuteReaderAsync())
+            while (await reader.ReadAsync())
+            {
+                var table = JsonSerializer.Deserialize<SourceSyncTable>(reader.GetString(0), SourceSyncCodec.Json) ?? throw new Exception("Invalid fixture SQL table manifest.");
+                if (!tables.TryAdd(table.Name, table)) throw new Exception("Duplicate fixture SQL table manifest.");
+            }
+        SourceSyncCodec.Tables(tables.Values.ToArray());
+        if (tables.Count != digests.Length) throw new Exception("Fixture report relation set differs from actual SQL.");
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        var results = new List<object>();
+        var rowCounts = new Dictionary<string,long>(StringComparer.Ordinal);
+        long totalRows = 0;
+        foreach (var expected in digests)
+        {
+            var name = expected.GetProperty("name").GetString() ?? throw new Exception("Missing fixture digest relation.");
+            if (!names.Add(name) || !tables.TryGetValue(name, out var table)) throw new Exception("Unexpected fixture digest relation.");
+            var columns = expected.GetProperty("columns").EnumerateArray().Select(value => value.GetString()).ToArray();
+            if (!table.Columns.SequenceEqual(columns, StringComparer.Ordinal)) throw new Exception("Fixture ordered column manifest differs from SQL.");
+            var expectedRows = expected.GetProperty("rows").GetInt64();
+            var expectedSum = Hex(expected.GetProperty("sum256").GetString());
+            var expectedXor = Hex(expected.GetProperty("xor256").GetString());
+            var sum = new byte[32]; var xor = new byte[32]; long rows = 0;
+            // Deliberately do not select __ss_* hashes: proof hashes actual SQL values.
+            await using var scan = new SqlCommand("SELECT " + string.Join(',', table.Columns.Select(SourceSyncCodec.Quote))
+                + " FROM [source_quanly]." + SourceSyncCodec.Quote(table.Name), db, tx) { CommandTimeout = 0 };
+            await using (var reader = await scan.ExecuteReaderAsync(CommandBehavior.SequentialAccess))
+                while (await reader.ReadAsync())
+                {
+                    var values = new string?[table.Columns.Length];
+                    for (var index = 0; index < values.Length; index++) values[index] = reader.IsDBNull(index) ? null : reader.GetString(index);
+                    var hashed = SourceSyncCodec.Hash(values); var carry = 0;
+                    for (var index = 31; index >= 0; index--) { carry += sum[index] + hashed[index]; sum[index] = (byte)carry; carry >>= 8; xor[index] ^= hashed[index]; }
+                    rows++;
+                }
+            if (rows != expectedRows || !CryptographicOperations.FixedTimeEquals(sum, expectedSum) || !CryptographicOperations.FixedTimeEquals(xor, expectedXor))
+                throw new Exception("Fixture actual SQL row multiset differs from the PostgreSQL digest report.");
+            totalRows = checked(totalRows + rows);
+            rowCounts.Add(name, rows);
+            results.Add(new { name, rows, match = true });
+        }
+        await tx.CommitAsync();
+        var paging = new SourceSyncStore(new FixedOptions(new SourceSyncOptions { Enabled = true, ConnectionString = connection,
+            Sources = new() { [source] = new() { InstallationId = installation, Key = new string('x', 40) } } }));
+        var keylessPages = new List<object>();
+        foreach (var table in tables.Values.Where(value => value.PrimaryKey.Length == 0))
+        {
+            string? cursor = null;
+            long represented = 0, groups = 0;
+            var cursors = new HashSet<string>(StringComparer.Ordinal);
+            do
+            {
+                var page = await paging.ReadPageAsync(source, table.Name, cursor, 1, null, null, null, CancellationToken.None);
+                represented = checked(represented + page.Rows.Sum(value => value.Occurrences));
+                groups += page.Rows.Count;
+                cursor = page.NextCursor;
+                if (cursor is not null && !cursors.Add(cursor)) throw new Exception("Keyless fixture paging repeated a cursor.");
+            } while (cursor is not null);
+            if (represented != rowCounts[table.Name]) throw new Exception("Keyless paging did not preserve the verified physical row multiplicity.");
+            keylessPages.Add(new { name = table.Name, groups, occurrences = represented });
+        }
+        Console.WriteLine(JsonSerializer.Serialize(new { ok = true, mode = "read_only_source_sql_digest_compare", source, installationId = installation,
+            generation, tableCount = results.Count, rowsTotal = totalRows, tables = results, keylessPages }, SourceSyncCodec.Json));
+    }
+
+    private static byte[] Hex(string? value)
+    {
+        if (value is null || value.Length != 64 || value.Any(character => !Uri.IsHexDigit(character))) throw new Exception("Invalid fixture multiset digest.");
+        return Convert.FromHexString(value);
+    }
+
+    private sealed class FixedOptions(SourceSyncOptions value) : IOptionsMonitor<SourceSyncOptions>
+    {
+        public SourceSyncOptions CurrentValue => value;
+        public SourceSyncOptions Get(string? name) => value;
+        public IDisposable? OnChange(Action<SourceSyncOptions, string?> listener) => null;
+    }
+}
